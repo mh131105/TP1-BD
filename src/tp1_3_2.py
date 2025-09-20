@@ -1,7 +1,174 @@
 import argparse
+import re
 import sys
 import time
+from typing import Dict, List, Optional, Sequence, Tuple
+
 from db import get_conn
+
+
+ReviewEntry = Dict[str, Optional[object]]
+CategoryPath = List[Tuple[str, str]]
+ProductData = Dict[str, object]
+
+
+REVIEW_PATTERN = re.compile(
+    r"^(?P<date>\d{4}-\d{1,2}-\d{1,2})\s+"
+    r"(?:customer|cutomer):\s*(?P<customer>\S+)\s+"
+    r"rating:\s*(?P<rating>\d+)\s+"
+    r"votes:\s*(?P<votes>\d+)\s+"
+    r"helpful:\s*(?P<helpful>\d+)"
+    r"$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_int(value: Optional[object], default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_float(value: Optional[object], default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_review_line(raw_line: str) -> Optional[ReviewEntry]:
+    match = REVIEW_PATTERN.match(raw_line.strip())
+    if not match:
+        return None
+    groups = match.groupdict()
+    return {
+        "date": groups.get("date"),
+        "customer": groups.get("customer"),
+        "rating": _normalize_int(groups.get("rating")),
+        "votes": _normalize_int(groups.get("votes")),
+        "helpful": _normalize_int(groups.get("helpful")),
+    }
+
+
+def _ensure_product_defaults(product_data: ProductData) -> Optional[Tuple[str, str, str, int, int, int, float]]:
+    asin = product_data.get("asin")
+    if not asin:
+        return None
+
+    title = product_data.get("title")
+    if not title:
+        title = "Unknown title"
+
+    group_name = product_data.get("group")
+    if not group_name:
+        group_name = "Unknown"
+
+    salesrank = _normalize_int(product_data.get("salesrank"))
+    total_reviews = _normalize_int(product_data.get("total_reviews"))
+    downloaded = _normalize_int(product_data.get("downloaded"))
+    avg_rating = _normalize_float(product_data.get("avg_rating"))
+
+    return asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating
+
+
+def _insert_product(
+    cur,
+    product_data: ProductData,
+    inserted_categories: set,
+    inserted_customers: set,
+    similar_pairs: List[Tuple[str, str]],
+) -> Tuple[int, int, int, int]:
+    product_defaults = _ensure_product_defaults(product_data)
+    if not product_defaults:
+        return 0, 0, 0, 0
+
+    asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating = product_defaults
+
+    cur.execute(
+        "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating),
+    )
+
+    prod_inc = 1
+    cat_inc = 0
+    cust_inc = 0
+    rev_inc = 0
+
+    for path in product_data.get("categories", []):
+        if not isinstance(path, Sequence) or not path:
+            continue
+        for idx, (cat_name, cat_id) in enumerate(path):
+            parent_id = None
+            if idx > 0:
+                parent_raw = path[idx - 1][1]
+                parent_id = int(parent_raw) if isinstance(parent_raw, str) and parent_raw.isdigit() else None
+            cat_id_val = int(cat_id) if isinstance(cat_id, str) and cat_id.isdigit() else None
+            if cat_id_val is not None and cat_id_val not in inserted_categories:
+                cur.execute(
+                    "INSERT INTO category (category_id, category_name, parent_id) VALUES (%s, %s, %s)",
+                    (cat_id_val, cat_name, parent_id),
+                )
+                inserted_categories.add(cat_id_val)
+                cat_inc += 1
+        leaf = path[-1][1] if path else None
+        leaf_id = int(leaf) if isinstance(leaf, str) and leaf.isdigit() else None
+        if leaf_id is not None:
+            cur.execute(
+                "INSERT INTO product_category (asin, category_id) VALUES (%s, %s)",
+                (asin, leaf_id),
+            )
+
+    for sim in product_data.get("similar", []):
+        if sim:
+            similar_pairs.append((asin, sim))
+
+    for rev in product_data.get("reviews", []):
+        if not isinstance(rev, dict):
+            continue
+        cust_id = rev.get("customer")
+        if not cust_id:
+            continue
+        if cust_id not in inserted_customers:
+            cur.execute(
+                "INSERT INTO customer (customer_id) VALUES (%s)",
+                (cust_id,),
+            )
+            inserted_customers.add(cust_id)
+            cust_inc += 1
+        rating = _normalize_int(rev.get("rating"))
+        votes = _normalize_int(rev.get("votes"))
+        helpful = _normalize_int(rev.get("helpful"))
+        review_date = rev.get("date")
+        if not review_date:
+            continue
+        cur.execute(
+            "INSERT INTO review (review_date, rating, votes, helpful, asin, customer_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            (review_date, rating, votes, helpful, asin, cust_id),
+        )
+        rev_inc += 1
+
+    return prod_inc, cat_inc, cust_inc, rev_inc
+
+
+def _new_product_data() -> ProductData:
+    return {
+        "asin": None,
+        "title": None,
+        "group": None,
+        "salesrank": None,
+        "total_reviews": None,
+        "downloaded": None,
+        "avg_rating": None,
+        "categories": [],
+        "similar": [],
+        "reviews": [],
+    }
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Script de carga (TP1 3.2) – cria o esquema e carrega dados no PostgreSQL.")
@@ -48,206 +215,90 @@ def main() -> int:
     # Processa o arquivo de entrada
     try:
         with open(args.input, "r", encoding="utf-8") as infile:
-            product_data = {}  # dicionário para dados do produto atual em parsing
+            product_data: Optional[ProductData] = None
             for raw_line in infile:
                 line = raw_line.strip()
                 if not line:
                     continue  # ignora linhas vazias
 
                 if line.startswith("Id:"):
-                    # Início de um novo produto
                     if product_data:
-                        # Finaliza inserções do produto anterior
-                        asin = product_data.get("asin")
-                        # Insere Produto
-                        cur.execute(
-                            "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                            (asin, product_data.get("title"), product_data.get("group"), product_data.get("salesrank"),
-                             product_data.get("total_reviews"), product_data.get("downloaded"), product_data.get("avg_rating"))
+                        prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
+                            cur, product_data, inserted_categories, inserted_customers, similar_pairs
                         )
-                        prod_count += 1
-                        # Insere categorias (e hierarquia) e relação produto-categoria
-                        for path in product_data.get("categories", []):
-                            for idx, (cat_name, cat_id) in enumerate(path):
-                                parent_id = None
-                                if idx > 0:
-                                    # parent_id = id da categoria anterior no caminho
-                                    parent_id = path[idx - 1][1]
-                                cat_id_val = int(cat_id) if cat_id.isdigit() else None
-                                if cat_id_val is not None and cat_id_val not in inserted_categories:
-                                    cur.execute(
-                                        "INSERT INTO category (category_id, category_name, parent_id) VALUES (%s, %s, %s)",
-                                        (cat_id_val, cat_name, parent_id)
-                                    )
-                                    inserted_categories.add(cat_id_val)
-                                    cat_count += 1
-                            # Liga o produto à categoria folha (última do caminho)
-                            leaf_id = int(path[-1][1]) if path[-1][1].isdigit() else None
-                            if leaf_id is not None:
-                                cur.execute(
-                                    "INSERT INTO product_category (asin, category_id) VALUES (%s, %s)",
-                                    (asin, leaf_id)
-                                )
-                        # Armazena relações similares (inserção diferida)
-                        for sim in product_data.get("similar", []):
-                            similar_pairs.append((asin, sim))
-                        # Insere reviews e clientes
-                        for rev in product_data.get("reviews", []):
-                            cust_id = rev.get("customer")
-                            if cust_id and cust_id not in inserted_customers:
-                                cur.execute(
-                                    "INSERT INTO customer (customer_id) VALUES (%s)",
-                                    (cust_id,)
-                                )
-                                inserted_customers.add(cust_id)
-                                cust_count += 1
-                            cur.execute(
-                                "INSERT INTO review (review_date, rating, votes, helpful, asin, customer_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                                (rev.get("date"), rev.get("rating"), rev.get("votes"), rev.get("helpful"), asin, cust_id)
-                            )
-                            rev_count += 1
+                        prod_count += prod_inc
+                        cat_count += cat_inc
+                        cust_count += cust_inc
+                        rev_count += rev_inc
+                    product_data = _new_product_data()
+                    continue
 
-                    # Prepara um novo produto em parsing
-                    product_data = {"asin": None, "title": None, "group": None, "salesrank": None,
-                                    "total_reviews": None, "downloaded": None, "avg_rating": None,
-                                    "categories": [], "similar": [], "reviews": []}
+                if product_data is None:
+                    continue
 
-                elif line.startswith("ASIN:"):
+                if line.startswith("ASIN:"):
                     product_data["asin"] = line.split(":", 1)[1].strip()
                 elif line.startswith("title:"):
                     product_data["title"] = line.split(":", 1)[1].strip()
+                elif line.lower().startswith("discontinued product"):
+                    product_data["title"] = "Discontinued product"
                 elif line.startswith("group:"):
                     product_data["group"] = line.split(":", 1)[1].strip()
                 elif line.startswith("salesrank:"):
                     val = line.split(":", 1)[1].strip()
-                    product_data["salesrank"] = int(val) if val.isdigit() else None
+                    product_data["salesrank"] = _normalize_int(val)
                 elif line.startswith("similar:"):
                     parts = line.split()
-                    if len(parts) >= 3:
-                        try:
-                            count_sim = int(parts[1])
-                        except:
-                            count_sim = 0
-                        # pega os ASINs listados após o número
+                    if len(parts) >= 2:
+                        count_sim = _normalize_int(parts[1])
                         sim_asins = parts[2:2 + count_sim] if count_sim > 0 else parts[2:]
                         product_data["similar"] = sim_asins
                 elif line.startswith("categories:"):
                     parts = line.split()
-                    num_paths = int(parts[1]) if len(parts) > 1 else 0
-                    for i in range(num_paths):
-                        cat_line = infile.readline().strip()
+                    num_paths = _normalize_int(parts[1]) if len(parts) > 1 else 0
+                    for _ in range(num_paths):
+                        cat_line = infile.readline()
+                        if not cat_line:
+                            break
+                        cat_line = cat_line.strip()
                         if not cat_line:
                             continue
-                        # Remove o '|' inicial e separa por '|'
                         if cat_line.startswith("|"):
                             cat_line = cat_line[1:]
                         segments = [seg for seg in cat_line.split("|") if seg]
-                        path = []
+                        path: CategoryPath = []
                         for seg in segments:
-                            # separa nome e id entre colchetes
                             if "[" in seg:
                                 name, cid = seg.rsplit("[", 1)
                                 cid = cid.rstrip("]")
                             else:
                                 name, cid = seg, ""
                             path.append((name.strip(), cid))
-                        product_data["categories"].append(path)
+                        if path:
+                            product_data["categories"].append(path)
                 elif line.startswith("reviews:"):
-                    # Exemplo: "reviews: total: 8  downloaded: 8  avg rating: 4"
-                    import re
                     m_total = re.search(r"total:\s*(\d+)", line)
                     m_down = re.search(r"downloaded:\s*(\d+)", line)
                     m_avg = re.search(r"avg rating:\s*([\d\.]+)", line)
-                    total_reviews = int(m_total.group(1)) if m_total else 0
-                    downloaded = int(m_down.group(1)) if m_down else 0
-                    avg_rating = float(m_avg.group(1)) if m_avg else None
-                    product_data["total_reviews"] = total_reviews
-                    product_data["downloaded"] = downloaded
-                    product_data["avg_rating"] = avg_rating
-                    # Ler as próximas 'downloaded' linhas de reviews
-                    for i in range(downloaded):
-                        rev_line = infile.readline().strip()
+                    product_data["total_reviews"] = int(m_total.group(1)) if m_total else None
+                    product_data["downloaded"] = int(m_down.group(1)) if m_down else None
+                    product_data["avg_rating"] = float(m_avg.group(1)) if m_avg else None
+                    num_to_read = _normalize_int(product_data.get("downloaded"))
+                    for _ in range(num_to_read):
+                        rev_line = infile.readline()
                         if not rev_line:
-                            continue
-                        tokens = rev_line.split()
-                        if len(tokens) >= 9:
-                            date = tokens[0]
-                            # tokens[1] deve ser "customer:" (possivelmente com colon junto)
-                            cust_token = tokens[1]
-                            customer_id = None
-                            if cust_token.startswith("customer"):
-                                # o ID do cliente pode estar no token[2] ou token[2] pode estar vazio se havia duplo espaço
-                                customer_id = tokens[2] if tokens[2] != ":" else tokens[3]
-                            # tokens[3] ou [4] é "rating:", seguido do valor
-                            # tokens[5] "votes:", tokens[7] "helpful:"
-                            try:
-                                rating_idx = tokens.index("rating:")  # encontra índice do token "rating:"
-                            except ValueError:
-                                rating_idx = None
-                            rating_val = int(tokens[rating_idx + 1]) if rating_idx else None
-                            try:
-                                votes_idx = tokens.index("votes:")
-                            except ValueError:
-                                votes_idx = None
-                            votes_val = int(tokens[votes_idx + 1]) if votes_idx else None
-                            try:
-                                helpful_idx = tokens.index("helpful:")
-                            except ValueError:
-                                helpful_idx = None
-                            helpful_val = int(tokens[helpful_idx + 1]) if helpful_idx else None
-                            review_entry = {
-                                "customer": customer_id,
-                                "date": date,
-                                "rating": rating_val,
-                                "votes": votes_val,
-                                "helpful": helpful_val
-                            }
+                            break
+                        review_entry = _parse_review_line(rev_line)
+                        if review_entry:
                             product_data["reviews"].append(review_entry)
-                        # (Se len(tokens) < 9, ignora – formato inesperado)
-            # Fim do loop: inserir o último produto lido (se existir)
-            if product_data and product_data.get("asin"):
-                asin = product_data["asin"]
-                cur.execute(
-                    "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (asin, product_data.get("title"), product_data.get("group"), product_data.get("salesrank"),
-                     product_data.get("total_reviews"), product_data.get("downloaded"), product_data.get("avg_rating"))
+            if product_data:
+                prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
+                    cur, product_data, inserted_categories, inserted_customers, similar_pairs
                 )
-                prod_count += 1
-                for path in product_data.get("categories", []):
-                    for idx, (cat_name, cat_id) in enumerate(path):
-                        parent_id = None
-                        if idx > 0:
-                            parent_id = path[idx - 1][1]
-                        cat_id_val = int(cat_id) if cat_id.isdigit() else None
-                        if cat_id_val is not None and cat_id_val not in inserted_categories:
-                            cur.execute(
-                                "INSERT INTO category (category_id, category_name, parent_id) VALUES (%s, %s, %s)",
-                                (cat_id_val, cat_name, parent_id)
-                            )
-                            inserted_categories.add(cat_id_val)
-                            cat_count += 1
-                    leaf_id = int(path[-1][1]) if path[-1][1].isdigit() else None
-                    if leaf_id is not None:
-                        cur.execute(
-                            "INSERT INTO product_category (asin, category_id) VALUES (%s, %s)",
-                            (asin, leaf_id)
-                        )
-                for sim in product_data.get("similar", []):
-                    similar_pairs.append((asin, sim))
-                for rev in product_data.get("reviews", []):
-                    cust_id = rev.get("customer")
-                    if cust_id and cust_id not in inserted_customers:
-                        cur.execute(
-                            "INSERT INTO customer (customer_id) VALUES (%s)",
-                            (cust_id,)
-                        )
-                        inserted_customers.add(cust_id)
-                        cust_count += 1
-                    cur.execute(
-                        "INSERT INTO review (review_date, rating, votes, helpful, asin, customer_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                        (rev.get("date"), rev.get("rating"), rev.get("votes"), rev.get("helpful"), asin, cust_id)
-                    )
-                    rev_count += 1
+                prod_count += prod_inc
+                cat_count += cat_inc
+                cust_count += cust_inc
+                rev_count += rev_inc
 
     except Exception as e:
         print(f"[Carga] Erro durante processamento do arquivo: {e}", file=sys.stderr)
