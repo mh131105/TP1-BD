@@ -2,7 +2,7 @@ import argparse
 import re
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from db import get_conn
 
@@ -79,6 +79,7 @@ def _ensure_product_defaults(product_data: ProductData) -> Optional[Tuple[str, s
 def _insert_product(
     cur,
     product_data: ProductData,
+    inserted_products: Set[str],
     inserted_categories: set,
     inserted_customers: set,
     similar_pairs: List[Tuple[str, str]],
@@ -94,6 +95,7 @@ def _insert_product(
         "VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating),
     )
+    inserted_products.add(asin)
 
     prod_inc = 1
     cat_inc = 0
@@ -206,9 +208,10 @@ def main() -> int:
         return 1
 
     # Inicializa estruturas auxiliares para evitar duplicatas
-    inserted_categories = set()   # IDs de categoria já inseridos
-    inserted_customers = set()    # IDs de cliente já inseridos
-    similar_pairs = []            # Armazena tuplas (asin, similar_asin) para inserir depois
+    inserted_products: Set[str] = set()  # ASINs já persistidos
+    inserted_categories = set()         # IDs de categoria já inseridos
+    inserted_customers = set()          # IDs de cliente já inseridos
+    similar_pairs = []                  # Armazena tuplas (asin, similar_asin) para inserir depois
 
     prod_count = cat_count = cust_count = rev_count = sim_count = 0
 
@@ -224,7 +227,12 @@ def main() -> int:
                 if line.startswith("Id:"):
                     if product_data:
                         prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                            cur, product_data, inserted_categories, inserted_customers, similar_pairs
+                            cur,
+                            product_data,
+                            inserted_products,
+                            inserted_categories,
+                            inserted_customers,
+                            similar_pairs,
                         )
                         prod_count += prod_inc
                         cat_count += cat_inc
@@ -293,7 +301,12 @@ def main() -> int:
                             product_data["reviews"].append(review_entry)
             if product_data:
                 prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                    cur, product_data, inserted_categories, inserted_customers, similar_pairs
+                    cur,
+                    product_data,
+                    inserted_products,
+                    inserted_categories,
+                    inserted_customers,
+                    similar_pairs,
                 )
                 prod_count += prod_inc
                 cat_count += cat_inc
@@ -308,7 +321,8 @@ def main() -> int:
     # Insere as relações de similaridade coletadas
     try:
         for asin, sim_asin in similar_pairs:
-            # Insere apenas se ambos asin e similar_asin existem na tabela product (FK garantirá isso)
+            if asin not in inserted_products or sim_asin not in inserted_products:
+                continue
             cur.execute(
                 "INSERT INTO product_similar (asin, similar_asin) VALUES (%s, %s)",
                 (asin, sim_asin)
