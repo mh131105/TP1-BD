@@ -1,14 +1,18 @@
+# Usa a imagem base oficial do Python 3.11 slim
 FROM python:3.11-slim
 
-# Defina o diretório de trabalho dentro do contêiner
+# Define o diretório de trabalho dentro do contêiner
 WORKDIR /app
 
-# Copie o arquivo de requisitos e instale as dependências
+# Copia o arquivo de dependências para o diretório de trabalho
 COPY requirements.txt .
+
+# Instala as dependências Python listadas em requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copie o código-fonte
-COPY src ./src
+# Copia todo o código-fonte da aplicação para o contêiner
+COPY src/ ./src/
+COPY sql/ ./sql/
 
-# Comando padrão: mostra a ajuda do script de consultas
-CMD ["python", "src/tp1_3_3.py", "--help"]
+# Define o comando padrão do contêiner (mostra ajuda do script de dashboard)
+CMD ["python", "src/tp1_3.3.py", "--help"]
