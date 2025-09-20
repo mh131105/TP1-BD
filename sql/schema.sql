@@ -1,53 +1,57 @@
--- SQL para criar o esquema do banco de dados
-
--- Dropa o esquema para recriar do zero
+-- Criação do esquema do banco de dados (TP1-BD)
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 
--- Tabela Product
+-- Tabela Product: informações básicas do produto
 CREATE TABLE product (
     asin VARCHAR(10) PRIMARY KEY,
-    title VARCHAR(255),
-    "group" VARCHAR(50),
-    salesrank INTEGER,
-    total_reviews INTEGER,
-    downloaded INTEGER,
-    avg_rating FLOAT
+    title VARCHAR(255) NOT NULL,
+    group_name VARCHAR(50) NOT NULL,      -- grupo principal do produto (ex: Book, DVD)
+    salesrank INTEGER NOT NULL,
+    total_reviews INTEGER NOT NULL,
+    downloaded INTEGER NOT NULL,
+    avg_rating FLOAT NOT NULL
 );
 
--- Tabela Customer
+-- Tabela Customer: clientes identificados por ID
 CREATE TABLE customer (
     customer_id VARCHAR(20) PRIMARY KEY
+    -- (Nenhum outro atributo disponível no dataset)
 );
 
--- Tabela Category
+-- Tabela Category: categorias de produto (hierarquia)
 CREATE TABLE category (
-    category_id SERIAL PRIMARY KEY,
-    category_name VARCHAR(100),
-    parent_id INTEGER
+    category_id INTEGER PRIMARY KEY,              -- usando IDs fornecidos no dataset
+    category_name VARCHAR(100) NOT NULL,
+    parent_id INTEGER,
+    FOREIGN KEY (parent_id) REFERENCES category(category_id)
 );
 
--- Tabela Review
+-- Tabela Review: avaliações de produtos pelos clientes
 CREATE TABLE review (
     review_id SERIAL PRIMARY KEY,
-    review_date DATE,
-    rating INTEGER,
-    helpful INTEGER,
-    votes INTEGER,
-    asin VARCHAR(10) REFERENCES product(asin),
-    customer_id VARCHAR(20) REFERENCES customer(customer_id)
+    review_date DATE NOT NULL,
+    rating INTEGER NOT NULL,
+    helpful INTEGER NOT NULL,
+    votes INTEGER NOT NULL,
+    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
+    customer_id VARCHAR(20) NOT NULL REFERENCES customer(customer_id)
 );
 
--- Tabela Product_Category
+-- Tabela Product_Category: relação N:N entre Product e Category (categoria(s) por produto)
 CREATE TABLE product_category (
-    asin VARCHAR(10) REFERENCES product(asin),
-    category_id INTEGER REFERENCES category(category_id),
+    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
+    category_id INTEGER NOT NULL REFERENCES category(category_id),
     PRIMARY KEY (asin, category_id)
 );
 
--- Tabela Product_Similar
+-- Tabela Product_Similar: relação N:N de "produtos similares" (co-compra)
 CREATE TABLE product_similar (
-    asin VARCHAR(10) REFERENCES product(asin),
-    similar_asin VARCHAR(10) REFERENCES product(asin),
+    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
+    similar_asin VARCHAR(10) NOT NULL REFERENCES product(asin),
     PRIMARY KEY (asin, similar_asin)
 );
+
+-- Índices auxiliares para desempenho em consultas
+CREATE INDEX idx_review_asin ON review(asin);
+CREATE INDEX idx_product_category_cat ON product_category(category_id);
