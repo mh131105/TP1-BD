@@ -4,7 +4,7 @@ import sys
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from psycopg import extras
+from psycopg.extras import execute_batch
 
 from db import get_conn
 
@@ -183,7 +183,7 @@ def _create_flush_function(
         inserted_now = 0
         cur.execute(f"SAVEPOINT {savepoint}")
         try:
-            extras.execute_batch(
+            execute_batch(
                 cur,
                 INSERT_STATEMENTS[table],
                 batch,
