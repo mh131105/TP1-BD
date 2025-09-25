@@ -4,9 +4,9 @@ CREATE SCHEMA public;
 
 -- Tabela Product: informações básicas do produto
 CREATE TABLE product (
-    asin VARCHAR(10) PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    group_name VARCHAR(50) NOT NULL,      -- grupo principal do produto (ex: Book, DVD)
+    asin VARCHAR(20) PRIMARY KEY,
+    title TEXT NOT NULL,
+    group_name TEXT NOT NULL,      -- grupo principal do produto (ex: Book, DVD)
     salesrank INTEGER NOT NULL,
     total_reviews INTEGER NOT NULL,
     downloaded INTEGER NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE customer (
 -- Tabela Category: categorias de produto (hierarquia)
 CREATE TABLE category (
     category_id INTEGER PRIMARY KEY,              -- usando IDs fornecidos no dataset
-    category_name VARCHAR(100) NOT NULL,
+    category_name TEXT NOT NULL,
     parent_id INTEGER
 );
 
@@ -33,7 +33,7 @@ CREATE TABLE review (
     rating INTEGER NOT NULL,
     helpful INTEGER NOT NULL,
     votes INTEGER NOT NULL,
-    asin VARCHAR(10) NOT NULL,
+    asin VARCHAR(20) NOT NULL,
     customer_id VARCHAR(20) NOT NULL,
     UNIQUE (asin, customer_id, review_date)
 );
@@ -46,8 +46,9 @@ CREATE TABLE product_category (
 );
 
 -- Tabela Product_Similar: relação N:N de "produtos similares" (co-compra)
+
 CREATE TABLE product_similar (
-    asin VARCHAR(10) NOT NULL,
-    similar_asin VARCHAR(10) NOT NULL,
+    asin VARCHAR(20) NOT NULL,
+    similar_asin VARCHAR(20) NOT NULL,
     PRIMARY KEY (asin, similar_asin)
 );
