@@ -23,8 +23,7 @@ CREATE TABLE customer (
 CREATE TABLE category (
     category_id INTEGER PRIMARY KEY,              -- usando IDs fornecidos no dataset
     category_name VARCHAR(100) NOT NULL,
-    parent_id INTEGER,
-    FOREIGN KEY (parent_id) REFERENCES category(category_id)
+    parent_id INTEGER
 );
 
 -- Tabela Review: avaliações de produtos pelos clientes
@@ -34,24 +33,21 @@ CREATE TABLE review (
     rating INTEGER NOT NULL,
     helpful INTEGER NOT NULL,
     votes INTEGER NOT NULL,
-    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
-    customer_id VARCHAR(20) NOT NULL REFERENCES customer(customer_id)
+    asin VARCHAR(10) NOT NULL,
+    customer_id VARCHAR(20) NOT NULL,
+    UNIQUE (asin, customer_id, review_date)
 );
 
 -- Tabela Product_Category: relação N:N entre Product e Category (categoria(s) por produto)
 CREATE TABLE product_category (
-    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
-    category_id INTEGER NOT NULL REFERENCES category(category_id),
+    asin VARCHAR(10) NOT NULL,
+    category_id INTEGER NOT NULL,
     PRIMARY KEY (asin, category_id)
 );
 
 -- Tabela Product_Similar: relação N:N de "produtos similares" (co-compra)
 CREATE TABLE product_similar (
-    asin VARCHAR(10) NOT NULL REFERENCES product(asin),
-    similar_asin VARCHAR(10) NOT NULL REFERENCES product(asin),
+    asin VARCHAR(10) NOT NULL,
+    similar_asin VARCHAR(10) NOT NULL,
     PRIMARY KEY (asin, similar_asin)
 );
-
--- Índices auxiliares para desempenho em consultas
-CREATE INDEX idx_review_asin ON review(asin);
-CREATE INDEX idx_product_category_cat ON product_category(category_id);

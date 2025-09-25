@@ -2,7 +2,23 @@ import argparse
 import re
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+try:
+    from psycopg import extras  # type: ignore
+except ImportError:  # pragma: no cover - fallback para builds sem extras
+    from typing import Iterable
+
+    class _ExtrasProxy:
+        @staticmethod
+        def execute_batch(cur, sql: str, params_seq: Sequence[Tuple[object, ...]], page_size: int = 100) -> None:
+            if page_size <= 0:
+                page_size = len(params_seq) or 1
+            for start in range(0, len(params_seq), page_size):
+                chunk: Iterable[Tuple[object, ...]] = params_seq[start : start + page_size]
+                cur.executemany(sql, chunk)
+
+    extras = _ExtrasProxy()
 
 from db import get_conn
 
@@ -10,6 +26,82 @@ from db import get_conn
 ReviewEntry = Dict[str, Optional[object]]
 CategoryPath = List[Tuple[str, str]]
 ProductData = Dict[str, object]
+FlushFunction = Callable[[str], None]
+
+BATCH_SIZE = 5000
+
+SQL_INSERT_PRODUCT = (
+    "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+    "ON CONFLICT (asin) DO UPDATE SET "
+    "title = EXCLUDED.title, "
+    "group_name = EXCLUDED.group_name, "
+    "salesrank = EXCLUDED.salesrank, "
+    "total_reviews = EXCLUDED.total_reviews, "
+    "downloaded = EXCLUDED.downloaded, "
+    "avg_rating = EXCLUDED.avg_rating"
+)
+
+SQL_INSERT_CATEGORY = (
+    "INSERT INTO category (category_id, category_name, parent_id) VALUES (%s, %s, %s) "
+    "ON CONFLICT (category_id) DO UPDATE SET "
+    "category_name = EXCLUDED.category_name, "
+    "parent_id = EXCLUDED.parent_id"
+)
+
+SQL_INSERT_PRODUCT_CATEGORY = (
+    "INSERT INTO product_category (asin, category_id) VALUES (%s, %s) "
+    "ON CONFLICT (asin, category_id) DO NOTHING"
+)
+
+SQL_INSERT_CUSTOMER = (
+    "INSERT INTO customer (customer_id) VALUES (%s) "
+    "ON CONFLICT (customer_id) DO NOTHING"
+)
+
+SQL_INSERT_REVIEW = (
+    "INSERT INTO review (review_date, rating, votes, helpful, asin, customer_id) "
+    "VALUES (%s, %s, %s, %s, %s, %s) "
+    "ON CONFLICT (asin, customer_id, review_date) DO NOTHING"
+)
+
+SQL_INSERT_SIMILAR = (
+    "INSERT INTO product_similar (asin, similar_asin) VALUES (%s, %s) "
+    "ON CONFLICT (asin, similar_asin) DO NOTHING"
+)
+
+INSERT_STATEMENTS: Dict[str, str] = {
+    "product": SQL_INSERT_PRODUCT,
+    "category": SQL_INSERT_CATEGORY,
+    "product_category": SQL_INSERT_PRODUCT_CATEGORY,
+    "customer": SQL_INSERT_CUSTOMER,
+    "review": SQL_INSERT_REVIEW,
+    "product_similar": SQL_INSERT_SIMILAR,
+}
+
+POST_LOAD_STATEMENTS: Tuple[str, ...] = (
+    "DELETE FROM product_category WHERE asin NOT IN (SELECT asin FROM product)",
+    "DELETE FROM product_category WHERE category_id NOT IN (SELECT category_id FROM category)",
+    "DELETE FROM product_similar WHERE asin NOT IN (SELECT asin FROM product)",
+    "DELETE FROM product_similar WHERE similar_asin NOT IN (SELECT asin FROM product)",
+    "ALTER TABLE category ADD CONSTRAINT fk_category_parent "
+    "FOREIGN KEY (parent_id) REFERENCES category(category_id) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE review ADD CONSTRAINT fk_review_product "
+    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE review ADD CONSTRAINT fk_review_customer "
+    "FOREIGN KEY (customer_id) REFERENCES customer(customer_id) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE product_category ADD CONSTRAINT fk_product_category_product "
+    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE product_category ADD CONSTRAINT fk_product_category_category "
+    "FOREIGN KEY (category_id) REFERENCES category(category_id) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE product_similar ADD CONSTRAINT fk_product_similar_product "
+    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE product_similar ADD CONSTRAINT fk_product_similar_similar "
+    "FOREIGN KEY (similar_asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
+    "CREATE INDEX idx_review_asin ON review(asin)",
+    "CREATE INDEX idx_product_category_cat ON product_category(category_id)",
+    "ANALYZE",
+)
 
 
 REVIEW_PATTERN = re.compile(
@@ -76,31 +168,101 @@ def _ensure_product_defaults(product_data: ProductData) -> Optional[Tuple[str, s
     return asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating
 
 
-def _insert_product(
+def _queue_with_flush(
+    table: str,
+    params: Tuple[object, ...],
+    buffers: Dict[str, List[Tuple[object, ...]]],
+    flush: "FlushFunction",
+) -> None:
+    buffer = buffers[table]
+    buffer.append(params)
+    if len(buffer) >= BATCH_SIZE:
+        flush(table)
+
+
+def _create_flush_function(
+    conn,
     cur,
+    buffers: Dict[str, List[Tuple[object, ...]]],
+    counts: Dict[str, int],
+    thresholds: Dict[str, int],
+    flush_counters: Dict[str, int],
+) -> FlushFunction:
+    def _flush(table: str) -> None:
+        batch = buffers[table]
+        if not batch:
+            return
+        savepoint = f"sp_{table}_{flush_counters[table]}"
+        flush_counters[table] += 1
+        inserted_now = 0
+        cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            extras.execute_batch(
+                cur,
+                INSERT_STATEMENTS[table],
+                batch,
+                page_size=BATCH_SIZE,
+            )
+            inserted_now = len(batch)
+        except Exception as batch_exc:  # pragma: no cover - fallback path
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            print(
+                f"[Carga][Aviso] Erro no lote da tabela {table}: {batch_exc}. "
+                "Tentando inserções individuais...",
+                file=sys.stderr,
+            )
+            for idx, params in enumerate(batch):
+                row_savepoint = f"{savepoint}_r{idx}"
+                cur.execute(f"SAVEPOINT {row_savepoint}")
+                try:
+                    cur.execute(INSERT_STATEMENTS[table], params)
+                    cur.execute(f"RELEASE SAVEPOINT {row_savepoint}")
+                    inserted_now += 1
+                except Exception as row_exc:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {row_savepoint}")
+                    print(
+                        f"[Carga][Erro] Registro ignorado em {table}: {row_exc}. Valores: {params}",
+                        file=sys.stderr,
+                    )
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+        conn.commit()
+        counts[table] += inserted_now
+        buffers[table].clear()
+        while counts[table] >= thresholds[table]:
+            print(f"[Carga][Batch] {table}: {counts[table]} registros inseridos.")
+            thresholds[table] += BATCH_SIZE
+
+    return _flush
+
+
+def _insert_product(
     product_data: ProductData,
+    buffers: Dict[str, List[Tuple[object, ...]]],
+    flush: "FlushFunction",
     inserted_products: Set[str],
-    inserted_categories: set,
-    inserted_customers: set,
-    similar_pairs: List[Tuple[str, str]],
-) -> Tuple[int, int, int, int]:
+    inserted_categories: Set[int],
+    inserted_customers: Set[str],
+    inserted_product_categories: Set[Tuple[str, int]],
+    inserted_similars: Set[Tuple[str, str]],
+    inserted_reviews: Set[Tuple[str, str, str]],
+) -> None:
     product_defaults = _ensure_product_defaults(product_data)
     if not product_defaults:
-        return 0, 0, 0, 0
+        return
 
     asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating = product_defaults
 
-    cur.execute(
-        "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating),
-    )
-    inserted_products.add(asin)
-
-    prod_inc = 1
-    cat_inc = 0
-    cust_inc = 0
-    rev_inc = 0
+    if asin not in inserted_products:
+        inserted_products.add(asin)
+        _queue_with_flush(
+            "product",
+            (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating),
+            buffers,
+            flush,
+        )
 
     for path in product_data.get("categories", []):
         if not isinstance(path, Sequence) or not path:
@@ -111,24 +273,31 @@ def _insert_product(
                 parent_raw = path[idx - 1][1]
                 parent_id = int(parent_raw) if isinstance(parent_raw, str) and parent_raw.isdigit() else None
             cat_id_val = int(cat_id) if isinstance(cat_id, str) and cat_id.isdigit() else None
-            if cat_id_val is not None and cat_id_val not in inserted_categories:
-                cur.execute(
-                    "INSERT INTO category (category_id, category_name, parent_id) VALUES (%s, %s, %s)",
-                    (cat_id_val, cat_name, parent_id),
-                )
+            if cat_id_val is None:
+                continue
+            if cat_id_val not in inserted_categories:
                 inserted_categories.add(cat_id_val)
-                cat_inc += 1
+                _queue_with_flush(
+                    "category",
+                    (cat_id_val, cat_name, parent_id),
+                    buffers,
+                    flush,
+                )
         leaf = path[-1][1] if path else None
         leaf_id = int(leaf) if isinstance(leaf, str) and leaf.isdigit() else None
         if leaf_id is not None:
-            cur.execute(
-                "INSERT INTO product_category (asin, category_id) VALUES (%s, %s)",
-                (asin, leaf_id),
-            )
+            pair = (asin, leaf_id)
+            if pair not in inserted_product_categories:
+                inserted_product_categories.add(pair)
+                _queue_with_flush("product_category", pair, buffers, flush)
 
     for sim in product_data.get("similar", []):
-        if sim:
-            similar_pairs.append((asin, sim))
+        if not sim:
+            continue
+        pair = (asin, sim)
+        if pair not in inserted_similars:
+            inserted_similars.add(pair)
+            _queue_with_flush("product_similar", pair, buffers, flush)
 
     for rev in product_data.get("reviews", []):
         if not isinstance(rev, dict):
@@ -137,25 +306,24 @@ def _insert_product(
         if not cust_id:
             continue
         if cust_id not in inserted_customers:
-            cur.execute(
-                "INSERT INTO customer (customer_id) VALUES (%s)",
-                (cust_id,),
-            )
             inserted_customers.add(cust_id)
-            cust_inc += 1
+            _queue_with_flush("customer", (cust_id,), buffers, flush)
         rating = _normalize_int(rev.get("rating"))
         votes = _normalize_int(rev.get("votes"))
         helpful = _normalize_int(rev.get("helpful"))
         review_date = rev.get("date")
         if not review_date:
             continue
-        cur.execute(
-            "INSERT INTO review (review_date, rating, votes, helpful, asin, customer_id) VALUES (%s, %s, %s, %s, %s, %s)",
+        review_key = (asin, cust_id, review_date)
+        if review_key in inserted_reviews:
+            continue
+        inserted_reviews.add(review_key)
+        _queue_with_flush(
+            "review",
             (review_date, rating, votes, helpful, asin, cust_id),
+            buffers,
+            flush,
         )
-        rev_inc += 1
-
-    return prod_inc, cat_inc, cust_inc, rev_inc
 
 
 def _new_product_data() -> ProductData:
@@ -171,6 +339,11 @@ def _new_product_data() -> ProductData:
         "similar": [],
         "reviews": [],
     }
+
+
+def _apply_post_load_constraints(cur) -> None:
+    for statement in POST_LOAD_STATEMENTS:
+        cur.execute(statement)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Script de carga (TP1 3.2) – cria o esquema e carrega dados no PostgreSQL.")
@@ -189,31 +362,54 @@ def main() -> int:
 
     # Conecta ao banco
     try:
-        # Usa autocommit=True para simplificar inserções em lote (evita necessidade de commits manuais)
-        conn = get_conn(args.db_host, args.db_port, args.db_name, args.db_user, args.db_pass, autocommit=True)
+        conn = get_conn(
+            args.db_host,
+            args.db_port,
+            args.db_name,
+            args.db_user,
+            args.db_pass,
+            autocommit=False,
+        )
     except Exception as e:
         print(f"[Carga] Erro ao conectar ao banco de dados: {e}", file=sys.stderr)
         return 1
 
     cur = conn.cursor()
+    try:
+        cur.execute("SET synchronous_commit TO OFF")
+        cur.execute("SET client_min_messages TO WARNING")
+        conn.commit()
+    except Exception as e:
+        print(f"[Carga] Aviso ao ajustar sessão: {e}", file=sys.stderr)
+
     # Executa DDL do schema
     try:
         with open("/app/sql/schema.sql", "r") as schema_file:
             schema_sql = schema_file.read()
-            cur.execute(schema_sql)
+            statements = [stmt.strip() for stmt in schema_sql.split(";") if stmt.strip()]
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
         print("[Carga] Esquema do banco de dados criado com sucesso.")
     except Exception as e:
         print(f"[Carga] Erro ao criar o esquema do banco: {e}", file=sys.stderr)
         conn.close()
         return 1
 
-    # Inicializa estruturas auxiliares para evitar duplicatas
-    inserted_products: Set[str] = set()  # ASINs já persistidos
-    inserted_categories = set()         # IDs de categoria já inseridos
-    inserted_customers = set()          # IDs de cliente já inseridos
-    similar_pairs = []                  # Armazena tuplas (asin, similar_asin) para inserir depois
+    buffers: Dict[str, List[Tuple[object, ...]]] = {table: [] for table in INSERT_STATEMENTS}
+    counts: Dict[str, int] = {table: 0 for table in INSERT_STATEMENTS}
+    thresholds: Dict[str, int] = {table: BATCH_SIZE for table in INSERT_STATEMENTS}
+    flush_counters: Dict[str, int] = {table: 0 for table in INSERT_STATEMENTS}
 
-    prod_count = cat_count = cust_count = rev_count = sim_count = 0
+    flush = _create_flush_function(conn, cur, buffers, counts, thresholds, flush_counters)
+
+    # Inicializa estruturas auxiliares para evitar duplicatas
+    inserted_products: Set[str] = set()
+    inserted_categories: Set[int] = set()
+    inserted_customers: Set[str] = set()
+    inserted_product_categories: Set[Tuple[str, int]] = set()
+    inserted_similars: Set[Tuple[str, str]] = set()
+    inserted_reviews: Set[Tuple[str, str, str]] = set()
 
     # Processa o arquivo de entrada
     try:
@@ -226,18 +422,17 @@ def main() -> int:
 
                 if line.startswith("Id:"):
                     if product_data:
-                        prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                            cur,
+                        _insert_product(
                             product_data,
+                            buffers,
+                            flush,
                             inserted_products,
                             inserted_categories,
                             inserted_customers,
-                            similar_pairs,
+                            inserted_product_categories,
+                            inserted_similars,
+                            inserted_reviews,
                         )
-                        prod_count += prod_inc
-                        cat_count += cat_inc
-                        cust_count += cust_inc
-                        rev_count += rev_inc
                     product_data = _new_product_data()
                     continue
 
@@ -300,36 +495,32 @@ def main() -> int:
                         if review_entry:
                             product_data["reviews"].append(review_entry)
             if product_data:
-                prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                    cur,
+                _insert_product(
                     product_data,
+                    buffers,
+                    flush,
                     inserted_products,
                     inserted_categories,
                     inserted_customers,
-                    similar_pairs,
+                    inserted_product_categories,
+                    inserted_similars,
+                    inserted_reviews,
                 )
-                prod_count += prod_inc
-                cat_count += cat_inc
-                cust_count += cust_inc
-                rev_count += rev_inc
 
     except Exception as e:
         print(f"[Carga] Erro durante processamento do arquivo: {e}", file=sys.stderr)
         conn.close()
         return 1
 
-    # Insere as relações de similaridade coletadas
+    # Flush final dos buffers
+    for table in INSERT_STATEMENTS:
+        flush(table)
+
     try:
-        for asin, sim_asin in similar_pairs:
-            if asin not in inserted_products or sim_asin not in inserted_products:
-                continue
-            cur.execute(
-                "INSERT INTO product_similar (asin, similar_asin) VALUES (%s, %s)",
-                (asin, sim_asin)
-            )
-            sim_count += 1
+        _apply_post_load_constraints(cur)
+        conn.commit()
     except Exception as e:
-        print(f"[Carga] Erro ao inserir relações similares: {e}", file=sys.stderr)
+        print(f"[Carga] Erro ao aplicar constraints pós-carga: {e}", file=sys.stderr)
         conn.close()
         return 1
 
@@ -337,7 +528,16 @@ def main() -> int:
     end_time = time.time()
     elapsed = end_time - start_time
     print(f"[Carga] Dados carregados com sucesso.")
-    print(f"[Carga] Totais inseridos -> Produtos: {prod_count}, Categorias: {cat_count}, Clientes: {cust_count}, Reviews: {rev_count}, Similaridades: {sim_count}.")
+    print(
+        "[Carga] Totais inseridos -> Produtos: {prod}, Categorias: {cat}, Clientes: {cust}, "
+        "Reviews: {rev}, Similaridades: {sim}.".format(
+            prod=counts["product"],
+            cat=counts["category"],
+            cust=counts["customer"],
+            rev=counts["review"],
+            sim=counts["product_similar"],
+        )
+    )
     print(f"[Carga] Tempo total de execução: {elapsed:.2f} segundos.")
     return 0
 
