@@ -4,8 +4,6 @@ import sys
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from psycopg import extras
-
 from db import get_conn
 
 
@@ -183,12 +181,7 @@ def _create_flush_function(
         inserted_now = 0
         cur.execute(f"SAVEPOINT {savepoint}")
         try:
-            extras.execute_batch(
-                cur,
-                INSERT_STATEMENTS[table],
-                batch,
-                page_size=BATCH_SIZE,
-            )
+            cur.executemany(INSERT_STATEMENTS[table], batch)
             inserted_now = len(batch)
         except Exception as batch_exc:  # pragma: no cover - fallback path
             cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
