@@ -2,19 +2,48 @@ import argparse
 import re
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
-
-from psycopg import extras
+from itertools import islice
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from db import get_conn
+
+
+BATCH_SIZE = 5000
+
+
+def _execute_batch(
+    cursor,
+    sql: str,
+    params_seq: Iterable[Tuple[object, ...]],
+    page_size: int = BATCH_SIZE,
+) -> None:
+    """Execute batched INSERTs without relying on psycopg.extras.
+
+    psycopg3 no longer bundles ``extras`` in some installation variants. To keep
+    the loader working regardless of the optional dependency, we mimic the
+    previous ``execute_batch`` helper by chunking the parameters and using the
+    native ``executemany`` call.
+    """
+
+    try:
+        chunk_size = int(page_size)
+    except (TypeError, ValueError):
+        chunk_size = BATCH_SIZE
+    if chunk_size <= 0:
+        chunk_size = BATCH_SIZE
+
+    iterator = iter(params_seq)
+    while True:
+        chunk = list(islice(iterator, chunk_size))
+        if not chunk:
+            break
+        cursor.executemany(sql, chunk)
 
 
 ReviewEntry = Dict[str, Optional[object]]
 CategoryPath = List[Tuple[str, str]]
 ProductData = Dict[str, object]
 FlushFunction = Callable[[str], None]
-
-BATCH_SIZE = 5000
 
 SQL_INSERT_PRODUCT = (
     "INSERT INTO product (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating) "
@@ -183,11 +212,10 @@ def _create_flush_function(
         inserted_now = 0
         cur.execute(f"SAVEPOINT {savepoint}")
         try:
-            extras.execute_batch(
+            _execute_batch(
                 cur,
                 INSERT_STATEMENTS[table],
                 batch,
-                page_size=BATCH_SIZE,
             )
             inserted_now = len(batch)
         except Exception as batch_exc:  # pragma: no cover - fallback path
