@@ -1,8 +1,9 @@
 import argparse
+import os
 import re
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from db import get_conn
 
@@ -79,6 +80,7 @@ def _ensure_product_defaults(product_data: ProductData) -> Optional[Tuple[str, s
 def _insert_product(
     cur,
     product_data: ProductData,
+    inserted_products: Set[str],
     inserted_categories: set,
     inserted_customers: set,
     similar_pairs: List[Tuple[str, str]],
@@ -94,6 +96,7 @@ def _insert_product(
         "VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating),
     )
+    inserted_products.add(asin)
 
     prod_inc = 1
     cat_inc = 0
@@ -195,8 +198,21 @@ def main() -> int:
 
     cur = conn.cursor()
     # Executa DDL do schema
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    schema_candidates = [
+        "/app/sql/schema.sql",
+        os.path.join(base_dir, "..", "sql", "schema.sql"),
+        os.path.join(os.getcwd(), "sql", "schema.sql"),
+    ]
+    schema_path = next((path for path in schema_candidates if os.path.exists(path)), None)
+
+    if not schema_path:
+        print("[Carga] Arquivo de schema não encontrado.", file=sys.stderr)
+        conn.close()
+        return 1
+
     try:
-        with open("/app/sql/schema.sql", "r") as schema_file:
+        with open(schema_path, "r") as schema_file:
             schema_sql = schema_file.read()
             cur.execute(schema_sql)
         print("[Carga] Esquema do banco de dados criado com sucesso.")
@@ -206,9 +222,10 @@ def main() -> int:
         return 1
 
     # Inicializa estruturas auxiliares para evitar duplicatas
-    inserted_categories = set()   # IDs de categoria já inseridos
-    inserted_customers = set()    # IDs de cliente já inseridos
-    similar_pairs = []            # Armazena tuplas (asin, similar_asin) para inserir depois
+    inserted_products: Set[str] = set()  # ASINs já persistidos
+    inserted_categories = set()         # IDs de categoria já inseridos
+    inserted_customers = set()          # IDs de cliente já inseridos
+    similar_pairs = []                  # Armazena tuplas (asin, similar_asin) para inserir depois
 
     prod_count = cat_count = cust_count = rev_count = sim_count = 0
 
@@ -224,7 +241,12 @@ def main() -> int:
                 if line.startswith("Id:"):
                     if product_data:
                         prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                            cur, product_data, inserted_categories, inserted_customers, similar_pairs
+                            cur,
+                            product_data,
+                            inserted_products,
+                            inserted_categories,
+                            inserted_customers,
+                            similar_pairs,
                         )
                         prod_count += prod_inc
                         cat_count += cat_inc
@@ -293,7 +315,12 @@ def main() -> int:
                             product_data["reviews"].append(review_entry)
             if product_data:
                 prod_inc, cat_inc, cust_inc, rev_inc = _insert_product(
-                    cur, product_data, inserted_categories, inserted_customers, similar_pairs
+                    cur,
+                    product_data,
+                    inserted_products,
+                    inserted_categories,
+                    inserted_customers,
+                    similar_pairs,
                 )
                 prod_count += prod_inc
                 cat_count += cat_inc
@@ -305,14 +332,31 @@ def main() -> int:
         conn.close()
         return 1
 
+    # Garante que o conjunto de ASINs reflita exatamente o que foi persistido no banco
+    try:
+        cur.execute("SELECT asin FROM product")
+        persisted_asins: Set[str] = {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        print(f"[Carga] Erro ao consultar produtos persistidos: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+
     # Insere as relações de similaridade coletadas
     try:
+        seen_pairs: Set[Tuple[str, str]] = set()
         for asin, sim_asin in similar_pairs:
-            # Insere apenas se ambos asin e similar_asin existem na tabela product (FK garantirá isso)
+            if asin == sim_asin:
+                continue
+            if asin not in persisted_asins or sim_asin not in persisted_asins:
+                continue
+            pair = (asin, sim_asin)
+            if pair in seen_pairs:
+                continue
             cur.execute(
                 "INSERT INTO product_similar (asin, similar_asin) VALUES (%s, %s)",
-                (asin, sim_asin)
+                pair,
             )
+            seen_pairs.add(pair)
             sim_count += 1
     except Exception as e:
         print(f"[Carga] Erro ao inserir relações similares: {e}", file=sys.stderr)
