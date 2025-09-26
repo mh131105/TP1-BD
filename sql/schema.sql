@@ -5,7 +5,7 @@ CREATE SCHEMA public;
 -- Tabela Product: informações básicas do produto
 CREATE TABLE product (
     asin VARCHAR(20) PRIMARY KEY,
-    title TEXT NOT NULL,
+    title TEXT,
     group_name TEXT,               -- grupo principal do produto (ex: Book, DVD)
     salesrank INTEGER,
     total_reviews INTEGER,
@@ -22,7 +22,7 @@ CREATE TABLE customer (
 -- Tabela Category: categorias de produto (hierarquia)
 CREATE TABLE category (
     category_id INTEGER PRIMARY KEY,              -- usando IDs fornecidos no dataset
-    category_name TEXT NOT NULL,
+    category_name TEXT,
     parent_id INTEGER,
     CONSTRAINT fk_category_parent
         FOREIGN KEY (parent_id)
@@ -33,10 +33,10 @@ CREATE TABLE category (
 -- Tabela Review: avaliações de produtos pelos clientes
 CREATE TABLE review (
     review_id SERIAL PRIMARY KEY,
-    review_date DATE NOT NULL,
-    rating INTEGER NOT NULL,
-    helpful INTEGER NOT NULL,
-    votes INTEGER NOT NULL,
+    review_date DATE,
+    rating INTEGER,
+    helpful INTEGER,
+    votes INTEGER,
     asin VARCHAR(20) NOT NULL,
     customer_id VARCHAR(20) NOT NULL,
     CONSTRAINT fk_review_product
@@ -52,7 +52,7 @@ CREATE TABLE review (
 
 -- Tabela Product_Category: relação N:N entre Product e Category (categoria(s) por produto)
 CREATE TABLE product_category (
-    asin VARCHAR(10) NOT NULL,
+    asin VARCHAR(20) NOT NULL,
     category_id INTEGER NOT NULL,
     PRIMARY KEY (asin, category_id),
     CONSTRAINT fk_product_category_product
