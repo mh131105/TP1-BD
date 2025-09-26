@@ -64,27 +64,22 @@ INSERT_STATEMENTS: Dict[str, str] = {
 }
 
 POST_LOAD_STATEMENTS: Tuple[str, ...] = (
-    "DELETE FROM product_category WHERE asin NOT IN (SELECT asin FROM product)",
-    "DELETE FROM product_category WHERE category_id NOT IN (SELECT category_id FROM category)",
-    "DELETE FROM product_similar WHERE asin NOT IN (SELECT asin FROM product)",
-    "DELETE FROM product_similar WHERE similar_asin NOT IN (SELECT asin FROM product)",
-    "ALTER TABLE category ADD CONSTRAINT fk_category_parent "
-    "FOREIGN KEY (parent_id) REFERENCES category(category_id) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE review ADD CONSTRAINT fk_review_product "
-    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE review ADD CONSTRAINT fk_review_customer "
-    "FOREIGN KEY (customer_id) REFERENCES customer(customer_id) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE product_category ADD CONSTRAINT fk_product_category_product "
-    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE product_category ADD CONSTRAINT fk_product_category_category "
-    "FOREIGN KEY (category_id) REFERENCES category(category_id) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE product_similar ADD CONSTRAINT fk_product_similar_product "
-    "FOREIGN KEY (asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
-    "ALTER TABLE product_similar ADD CONSTRAINT fk_product_similar_similar "
-    "FOREIGN KEY (similar_asin) REFERENCES product(asin) DEFERRABLE INITIALLY DEFERRED",
-    "CREATE INDEX idx_review_asin ON review(asin)",
-    "CREATE INDEX idx_product_category_cat ON product_category(category_id)",
     "ANALYZE",
+)
+
+TABLE_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
+    "product_category": ("product", "category"),
+    "review": ("product", "customer"),
+    "product_similar": ("product",),
+}
+
+FINAL_FLUSH_ORDER: Tuple[str, ...] = (
+    "product",
+    "category",
+    "customer",
+    "review",
+    "product_category",
+    "product_similar",
 )
 
 
@@ -131,23 +126,46 @@ def _parse_review_line(raw_line: str) -> Optional[ReviewEntry]:
     }
 
 
-def _ensure_product_defaults(product_data: ProductData) -> Optional[Tuple[str, str, str, int, int, int, float]]:
+def _ensure_product_defaults(
+    product_data: ProductData,
+) -> Optional[Tuple[str, str, Optional[str], Optional[int], Optional[int], Optional[int], Optional[float]]]:
     asin = product_data.get("asin")
     if not asin:
         return None
 
+    discontinued = bool(product_data.get("discontinued"))
+
     title = product_data.get("title")
     if not title:
-        title = "Unknown title"
+        title = "Discontinued product" if discontinued else "Unknown title"
 
     group_name = product_data.get("group")
     if not group_name:
-        group_name = "Unknown"
+        group_name = None if discontinued else "Unknown"
 
-    salesrank = _normalize_int(product_data.get("salesrank"))
-    total_reviews = _normalize_int(product_data.get("total_reviews"))
-    downloaded = _normalize_int(product_data.get("downloaded"))
-    avg_rating = _normalize_float(product_data.get("avg_rating"))
+    salesrank_raw = product_data.get("salesrank")
+    if discontinued:
+        salesrank = salesrank_raw if isinstance(salesrank_raw, int) else None
+    else:
+        salesrank = _normalize_int(salesrank_raw)
+
+    total_reviews_raw = product_data.get("total_reviews")
+    if discontinued and total_reviews_raw is None:
+        total_reviews = None
+    else:
+        total_reviews = _normalize_int(total_reviews_raw)
+
+    downloaded_raw = product_data.get("downloaded")
+    if discontinued and downloaded_raw is None:
+        downloaded = None
+    else:
+        downloaded = _normalize_int(downloaded_raw)
+
+    avg_rating_raw = product_data.get("avg_rating")
+    if discontinued and avg_rating_raw is None:
+        avg_rating = None
+    else:
+        avg_rating = _normalize_float(avg_rating_raw)
 
     return asin, title, group_name, salesrank, total_reviews, downloaded, avg_rating
 
@@ -157,10 +175,13 @@ def _queue_with_flush(
     params: Tuple[object, ...],
     buffers: Dict[str, List[Tuple[object, ...]]],
     flush: "FlushFunction",
+    dependencies: Dict[str, Tuple[str, ...]] = TABLE_DEPENDENCIES,
 ) -> None:
     buffer = buffers[table]
     buffer.append(params)
     if len(buffer) >= BATCH_SIZE:
+        for dep_table in dependencies.get(table, ()):  # garante que dependências existam antes do commit
+            flush(dep_table)
         flush(table)
 
 
@@ -226,6 +247,7 @@ def _insert_product(
     inserted_customers: Set[str],
     inserted_product_categories: Set[Tuple[str, int]],
     inserted_similars: Set[Tuple[str, str]],
+    pending_similars: Dict[str, Set[str]],
     inserted_reviews: Set[Tuple[str, str, str]],
 ) -> None:
     product_defaults = _ensure_product_defaults(product_data)
@@ -273,8 +295,20 @@ def _insert_product(
     for sim in product_data.get("similar", []):
         if not sim:
             continue
-        pair = (asin, sim)
-        if pair not in inserted_similars:
+        if sim == asin:
+            continue
+        if sim in inserted_products:
+            pair = (asin, sim)
+            if pair not in inserted_similars:
+                inserted_similars.add(pair)
+                _queue_with_flush("product_similar", pair, buffers, flush)
+        else:
+            pending_similars.setdefault(sim, set()).add(asin)
+
+    waiting_sources = pending_similars.pop(asin, set())
+    for source in waiting_sources:
+        pair = (source, asin)
+        if pair not in inserted_similars and source in inserted_products:
             inserted_similars.add(pair)
             _queue_with_flush("product_similar", pair, buffers, flush)
 
@@ -314,6 +348,7 @@ def _new_product_data() -> ProductData:
         "total_reviews": None,
         "downloaded": None,
         "avg_rating": None,
+        "discontinued": False,
         "categories": [],
         "similar": [],
         "reviews": [],
@@ -388,6 +423,7 @@ def main() -> int:
     inserted_customers: Set[str] = set()
     inserted_product_categories: Set[Tuple[str, int]] = set()
     inserted_similars: Set[Tuple[str, str]] = set()
+    pending_similars: Dict[str, Set[str]] = {}
     inserted_reviews: Set[Tuple[str, str, str]] = set()
 
     # Processa o arquivo de entrada
@@ -410,6 +446,7 @@ def main() -> int:
                             inserted_customers,
                             inserted_product_categories,
                             inserted_similars,
+                            pending_similars,
                             inserted_reviews,
                         )
                     product_data = _new_product_data()
@@ -424,6 +461,7 @@ def main() -> int:
                     product_data["title"] = line.split(":", 1)[1].strip()
                 elif line.lower().startswith("discontinued product"):
                     product_data["title"] = "Discontinued product"
+                    product_data["discontinued"] = True
                 elif line.startswith("group:"):
                     product_data["group"] = line.split(":", 1)[1].strip()
                 elif line.startswith("salesrank:"):
@@ -483,6 +521,7 @@ def main() -> int:
                     inserted_customers,
                     inserted_product_categories,
                     inserted_similars,
+                    pending_similars,
                     inserted_reviews,
                 )
 
@@ -492,7 +531,7 @@ def main() -> int:
         return 1
 
     # Flush final dos buffers
-    for table in INSERT_STATEMENTS:
+    for table in FINAL_FLUSH_ORDER:
         flush(table)
 
     try:
