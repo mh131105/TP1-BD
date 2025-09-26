@@ -190,7 +190,6 @@ def _create_flush_function(
     cur,
     buffers: Dict[str, List[Tuple[object, ...]]],
     counts: Dict[str, int],
-    thresholds: Dict[str, int],
     flush_counters: Dict[str, int],
 ) -> FlushFunction:
     def _flush(table: str) -> None:
@@ -231,9 +230,8 @@ def _create_flush_function(
         conn.commit()
         counts[table] += inserted_now
         buffers[table].clear()
-        while counts[table] >= thresholds[table]:
+        if inserted_now and counts[table] % BATCH_SIZE == 0:
             print(f"[Carga][Batch] {table}: {counts[table]} registros inseridos.")
-            thresholds[table] += BATCH_SIZE
 
     return _flush
 
@@ -243,12 +241,7 @@ def _insert_product(
     buffers: Dict[str, List[Tuple[object, ...]]],
     flush: "FlushFunction",
     inserted_products: Set[str],
-    inserted_categories: Set[int],
-    inserted_customers: Set[str],
-    inserted_product_categories: Set[Tuple[str, int]],
-    inserted_similars: Set[Tuple[str, str]],
     pending_similars: Dict[str, Set[str]],
-    inserted_reviews: Set[Tuple[str, str, str]],
 ) -> None:
     product_defaults = _ensure_product_defaults(product_data)
     if not product_defaults:
@@ -276,21 +269,17 @@ def _insert_product(
             cat_id_val = int(cat_id) if isinstance(cat_id, str) and cat_id.isdigit() else None
             if cat_id_val is None:
                 continue
-            if cat_id_val not in inserted_categories:
-                inserted_categories.add(cat_id_val)
-                _queue_with_flush(
-                    "category",
-                    (cat_id_val, cat_name, parent_id),
-                    buffers,
-                    flush,
-                )
+            _queue_with_flush(
+                "category",
+                (cat_id_val, cat_name, parent_id),
+                buffers,
+                flush,
+            )
         leaf = path[-1][1] if path else None
         leaf_id = int(leaf) if isinstance(leaf, str) and leaf.isdigit() else None
         if leaf_id is not None:
             pair = (asin, leaf_id)
-            if pair not in inserted_product_categories:
-                inserted_product_categories.add(pair)
-                _queue_with_flush("product_category", pair, buffers, flush)
+            _queue_with_flush("product_category", pair, buffers, flush)
 
     for sim in product_data.get("similar", []):
         if not sim:
@@ -299,17 +288,14 @@ def _insert_product(
             continue
         if sim in inserted_products:
             pair = (asin, sim)
-            if pair not in inserted_similars:
-                inserted_similars.add(pair)
-                _queue_with_flush("product_similar", pair, buffers, flush)
+            _queue_with_flush("product_similar", pair, buffers, flush)
         else:
             pending_similars.setdefault(sim, set()).add(asin)
 
     waiting_sources = pending_similars.pop(asin, set())
     for source in waiting_sources:
         pair = (source, asin)
-        if pair not in inserted_similars and source in inserted_products:
-            inserted_similars.add(pair)
+        if source in inserted_products:
             _queue_with_flush("product_similar", pair, buffers, flush)
 
     for rev in product_data.get("reviews", []):
@@ -318,19 +304,13 @@ def _insert_product(
         cust_id = rev.get("customer")
         if not cust_id:
             continue
-        if cust_id not in inserted_customers:
-            inserted_customers.add(cust_id)
-            _queue_with_flush("customer", (cust_id,), buffers, flush)
+        _queue_with_flush("customer", (cust_id,), buffers, flush)
         rating = _normalize_int(rev.get("rating"))
         votes = _normalize_int(rev.get("votes"))
         helpful = _normalize_int(rev.get("helpful"))
         review_date = rev.get("date")
         if not review_date:
             continue
-        review_key = (asin, cust_id, review_date)
-        if review_key in inserted_reviews:
-            continue
-        inserted_reviews.add(review_key)
         _queue_with_flush(
             "review",
             (review_date, rating, votes, helpful, asin, cust_id),
@@ -412,19 +392,13 @@ def main() -> int:
 
     buffers: Dict[str, List[Tuple[object, ...]]] = {table: [] for table in INSERT_STATEMENTS}
     counts: Dict[str, int] = {table: 0 for table in INSERT_STATEMENTS}
-    thresholds: Dict[str, int] = {table: BATCH_SIZE for table in INSERT_STATEMENTS}
     flush_counters: Dict[str, int] = {table: 0 for table in INSERT_STATEMENTS}
 
-    flush = _create_flush_function(conn, cur, buffers, counts, thresholds, flush_counters)
+    flush = _create_flush_function(conn, cur, buffers, counts, flush_counters)
 
     # Inicializa estruturas auxiliares para evitar duplicatas
     inserted_products: Set[str] = set()
-    inserted_categories: Set[int] = set()
-    inserted_customers: Set[str] = set()
-    inserted_product_categories: Set[Tuple[str, int]] = set()
-    inserted_similars: Set[Tuple[str, str]] = set()
     pending_similars: Dict[str, Set[str]] = {}
-    inserted_reviews: Set[Tuple[str, str, str]] = set()
 
     # Processa o arquivo de entrada
     try:
@@ -442,12 +416,7 @@ def main() -> int:
                             buffers,
                             flush,
                             inserted_products,
-                            inserted_categories,
-                            inserted_customers,
-                            inserted_product_categories,
-                            inserted_similars,
                             pending_similars,
-                            inserted_reviews,
                         )
                     product_data = _new_product_data()
                     continue
@@ -517,12 +486,7 @@ def main() -> int:
                     buffers,
                     flush,
                     inserted_products,
-                    inserted_categories,
-                    inserted_customers,
-                    inserted_product_categories,
-                    inserted_similars,
                     pending_similars,
-                    inserted_reviews,
                 )
 
     except Exception as e:
