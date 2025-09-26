@@ -22,10 +22,13 @@ docker compose run --rm app python src/tp1_3.2.py \
 
 ## 3) Executar o Dashboard (todas as consultas)
 ```
+# Exemplo usando um ASIN real do dataset (1559362022)
 docker compose run --rm app python src/tp1_3.3.py \
   --db-host db --db-port 5432 --db-name ecommerce \
   --db-user postgres --db-pass postgres \
+  --product-asin 1559362022 \
   --output /app/out
+
 ```
 * Roda o script `tp1_3.3.py`, que consulta o banco e gera os relatórios do dashboard.
 * Os resultados são gravados no diretório `./out` do host (montado como `/app/out` dentro do contêiner `app`).
